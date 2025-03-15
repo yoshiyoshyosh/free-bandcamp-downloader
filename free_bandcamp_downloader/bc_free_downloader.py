@@ -11,7 +11,6 @@ import zipfile
 import mutagen
 import pyrfc6266
 import requests
-import secmail
 
 from bs4 import BeautifulSoup
 from docopt import docopt
@@ -24,6 +23,7 @@ from urllib.parse import urljoin, urlsplit
 
 from free_bandcamp_downloader import logger
 from free_bandcamp_downloader.bandcamp_http_adapter import *
+from free_bandcamp_downloader.guerrillamail import GMSession
 
 @dataclass
 class BCFreeDownloaderOptions:
@@ -64,15 +64,15 @@ class BCFreeDownloader:
         self.download_history_file = download_history_file
         self.downloaded: Set[str] = set()  # can be URL or ID
         self.mail_session = None
-        self.queued_emails: Dict # { ("album"|"track", id): {info} }
+        self.queued_emails = {} # { ("album"|"track", id): {info} }
         self.session = None
         self._init_email()
         self._init_session(cookies_file, identity)
 
     def _init_email(self):
         if not self.options.email or self.options.email == "auto":
-            self.mail_session = secmail.Client(self.config_dir)
-            self.options.email = self.mail_session.random_email(1, "1secmail.com")[0]
+            self.mail_session = GMSession()
+            self.options.email = self.mail_session.get_email_address()
 
     def _init_session(self, cookies_file: Optional[str], identity: Optional[str]):
         self.session = requests.Session()
@@ -307,29 +307,42 @@ class BCFreeDownloader:
 
     def flush_email_downloads(self) -> set:
         checked_ids = set()
-        downloaded = set()
-        while (expected_emails := len(self.queued_emails)) > 0:
-            logger.info(f"Waiting for {expected_emails} emails from Bandcamp...")
+        downloaded = dict()
+        # timeout count--if we go 30 seconds without any new emails
+        # and we are still waiting, we probably had some emails dropped / expired
+        timeout_count = 0
+        while len(self.queued_emails) > 0:
+            logger.info(f"Waiting for {len(self.queued_emails)} emails from Bandcamp...")
             time.sleep(5)
-            for email in self.mail_session.get_inbox(self.options.email):
-                if email.id in checked_ids:
+            email_list = self.mail_session.get_all_emails()
+            for email in email_list:
+                timeout_count = 0
+                if email["mail_id"] in checked_ids:
                     continue
 
-                checked_ids.add(email.id)
+                checked_ids.add(email["mail_id"])
                 if (
-                    email.from_address.endswith("@email.bandcamp.com")
-                    and "download" in email.subject
+                    email["mail_from"] == ("noreply@bandcamp.com")
+                    and "download" in email["mail_subject"]
                 ):
-                    logger.info(f'Received email "{email.subject}"')
-                    email = self.mail_session.get_message(
-                        self.options.email, email.id
-                    )
-                    match = self.LINK_REGEX.search(email.html_body)
+                    logger.info(f'Received email "{email["mail_subject"]}"')
+                    email = self.mail_session.get_email(email["mail_id"])
+                    match = self.LINK_REGEX.search(email["mail_body"])
                     if match:
                         download_url = match.group("url")
                         dlret = self._download_file(download_url, self.options.format)
                         self.queued_emails.pop(dlret["id"])
                         downloaded[dlret["id"]] = dlret["file_name"]
+            if email_list:
+                self.mail_session.del_emails([e['mail_id'] for e in email_list])
+            timeout_count += 1
+
+            if timeout_count > 5:
+                logger.info(f'Not all emails received. Resending missed ones...')
+                self.queued_emails = 0
+                for album_data in self.queued_emails:
+                    soup = self.get_url(album_data["tralbum_data"]["url"])
+                    self.download_album(soup)
         return downloaded
 
     # get_url_x can't be staticmethods because of special session context
