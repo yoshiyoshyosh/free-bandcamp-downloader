@@ -24,6 +24,7 @@ from guerrillamail import GuerrillaMailSession
 
 from free_bandcamp_downloader import logger
 from free_bandcamp_downloader.bandcamp_http_adapter import *
+from free_bandcamp_downloader.guerrillamail import GMSession
 
 class DownloadRet(TypedDict):
     id: Tuple[str, int]
@@ -91,8 +92,8 @@ class BCFreeDownloader:
         if not self.options.email:
             self.options.email = "auto"
         if self.options.email == "auto":
-            self.mail_session = GuerrillaMailSession()
-            self.options.email = self.mail_session.get_session_state()["email_address"]
+            self.mail_session = GMSession()
+            self.options.email = self.mail_session.get_email_address()
 
     def _init_session(self):
         self.session = requests.Session()
@@ -316,22 +317,26 @@ class BCFreeDownloader:
     def flush_email_downloads(self) -> Set[DownloadRet]:
         checked_ids = set()
         downloaded = {}
-        while (expected_emails := len(self.queued_emails)) > 0:
-            logger.info(f"Waiting for {expected_emails} emails from Bandcamp...")
+        # timeout count--if we go 30 seconds without any new emails
+        # and we are still waiting, some were probably dropped/expired
+        timeout_count = 0
+        while len(self.queued_emails) > 0:
+            logger.info(f"Waiting for {len(self.queued_emails)} emails from Bandcamp...")
             time.sleep(5)
-            for email in self.mail_session.get_email_list():
-                email_id = email.guid
-                if email_id in checked_ids:
+            email_list = self.mail_session.get_all_emails()
+            for email in email_list:
+                timeout_count = 0
+                if email["mail_id"] in checked_ids:
                     continue
 
-                checked_ids.add(email_id)
+                checked_ids.add(email["mail_id"])
                 if (
-                    email.sender == "noreply@bandcamp.com"
-                    and "download" in email.subject
+                    email["mail_from"] == "noreply@bandcamp.com"
+                    and "download" in email["mail_subject"]
                 ):
-                    logger.info(f'Received email "{email.subject}"')
-                    content = self.mail_session.get_email(email_id).body
-                    match = self.LINK_REGEX.search(content)
+                    logger.info(f'Received email "{email["mail_subject"]}"')
+                    email = self.mail_session.get_email(email["mail_id"])
+                    match = self.LINK_REGEX.search(email["mail_body"])
                     if match:
                         download_url = match.group("url")
                         dlret = self._download_file(download_url, self.options.format)
@@ -339,6 +344,15 @@ class BCFreeDownloader:
                         downloaded[dlret["id"]] = dlret["file_name"]
                     else:
                         logger.error(f"Could not find download URL in body: {content}")
+            if email_list:
+                self.mail_session.del_emails([e['mail_id'] for e in email_list])
+            timeout_count += 1
+
+            if timeout_count > 5:
+                logger.info(f'Not all emails received. Resending missed ones...')
+                for album_data in self.queued_emails:
+                    soup = self.get_url(album_data["tralbum_data"]["url"])
+                    self.download_album(soup)
         return downloaded
 
     # get_url_x can't be staticmethods because of special session context
